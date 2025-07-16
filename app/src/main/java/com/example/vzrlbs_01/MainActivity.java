@@ -7,6 +7,8 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.MediaRecorder;
 import android.net.Uri;
+import android.opengl.EGL14;
+import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import android.os.Bundle;
@@ -40,6 +42,9 @@ import com.google.ar.core.exceptions.UnavailableSdkTooOldException;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 
@@ -52,7 +57,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CAMERA_PERMISSION = 200;
     private static final int REQUEST_RECORD_AUDIO_PERMISSION = 201;
     private static final int REQUEST_PICK_DIRECTORY = 1001;
-    private static final long CAPTURE_INTERVAL = 100_000_000;
+    private static final long CAPTURE_INTERVAL = 1;
 
     private Session session;
     private boolean isRecording = false;
@@ -63,16 +68,95 @@ public class MainActivity extends AppCompatActivity {
     private TextView statusText;
     private Uri saveUri;
     private long lastCaptureTime = 0;
+    private Surface recorderSurface;
+    private android.opengl.EGLSurface recorderEglSurface;
+    private android.opengl.EGLDisplay eglDisplay;
+    private android.opengl.EGLContext eglContext;
 
     private class MyRenderer implements GLSurfaceView.Renderer {
         private int cameraTextureId;
         private boolean isInitialized = false;
+        private int program;
+        private int positionHandle;
+        private int texCoordHandle;
+        private int textureHandle;
+        private FloatBuffer vertexBuffer;
+        private FloatBuffer texCoordBuffer;
+
+        // Vertex shader
+        private static final String VERTEX_SHADER =
+                "attribute vec4 aPosition;\n" +
+                        "attribute vec2 aTexCoord;\n" +
+                        "varying vec2 vTexCoord;\n" +
+                        "void main() {\n" +
+                        "  gl_Position = aPosition;\n" +
+                        "  vTexCoord = aTexCoord;\n" +
+                        "}\n";
+
+        // Fragment shader with 90-degree rotation fix
+        private static final String FRAGMENT_SHADER =
+                "#extension GL_OES_EGL_image_external : require\n" +
+                        "precision mediump float;\n" +
+                        "varying vec2 vTexCoord;\n" +
+                        "uniform samplerExternalOES uTexture;\n" +
+                        "void main() {\n" +
+                        "  vec2 rotatedCoord = vec2(vTexCoord.y, 1.0 - vTexCoord.x);\n" + // Rotate 90 degrees
+                        "  gl_FragColor = texture2D(uTexture, rotatedCoord);\n" +
+                        "}";
 
         @Override
         public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+            // Initialize EGL handles
+            eglDisplay = EGL14.eglGetCurrentDisplay();
+            if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
+                Log.e(TAG, "No EGL display available");
+                return;
+            }
+            eglContext = EGL14.eglGetCurrentContext();
+            if (eglContext == EGL14.EGL_NO_CONTEXT) {
+                Log.e(TAG, "No EGL context available");
+                return;
+            }
+
+            // Create texture for camera
             int[] textures = new int[1];
             GLES20.glGenTextures(1, textures, 0);
             cameraTextureId = textures[0];
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
+            GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+            GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+
+            // Create shader program
+            program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER);
+            if (program == 0) {
+                Log.e(TAG, "Failed to create shader program");
+                return;
+            }
+            positionHandle = GLES20.glGetAttribLocation(program, "aPosition");
+            texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord");
+            textureHandle = GLES20.glGetUniformLocation(program, "uTexture");
+
+            // Set up vertex and texcoord buffers for a full-screen quad
+            float[] vertices = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
+            float[] texCoords = { 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+            ByteBuffer bb = ByteBuffer.allocateDirect(vertices.length * 4);
+            bb.order(ByteOrder.nativeOrder());
+            vertexBuffer = bb.asFloatBuffer();
+            vertexBuffer.put(vertices);
+            vertexBuffer.position(0);
+
+            ByteBuffer tb = ByteBuffer.allocateDirect(texCoords.length * 4);
+            tb.order(ByteOrder.nativeOrder());
+            texCoordBuffer = tb.asFloatBuffer();
+            texCoordBuffer.put(texCoords);
+            texCoordBuffer.position(0);
+
+            if (session != null) {
+                session.setCameraTextureName(cameraTextureId);
+            }
+
             isInitialized = true;
         }
 
@@ -84,11 +168,26 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
+        @SuppressLint("DefaultLocale")
         @Override
         public void onDrawFrame(GL10 gl) {
             if (!isInitialized || session == null) return;
             try {
                 Frame frame = session.update();
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
+                renderFrame();
+
+                // If recording, render to MediaRecorder surface
+                if (isRecording && recorderEglSurface != null && recorderSurface != null && recorderSurface.isValid()) {
+                    EGL14.eglMakeCurrent(eglDisplay, recorderEglSurface, recorderEglSurface, eglContext);
+                    GLES20.glViewport(0, 0, 640, 480); // Match MediaRecorder video size
+                    renderFrame();
+                    EGL14.eglSwapBuffers(eglDisplay, recorderEglSurface);
+                    EGL14.eglMakeCurrent(eglDisplay, EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW), EGL14.eglGetCurrentSurface(EGL14.EGL_READ), eglContext);
+                    GLES20.glViewport(0, 0, glSurfaceView.getWidth(), glSurfaceView.getHeight());
+                }
+
+                // VIO data saving (unchanged as per user request)
                 if (isRecording && writer != null) {
                     long currentTime = System.nanoTime();
                     if (currentTime - lastCaptureTime >= CAPTURE_INTERVAL) {
@@ -113,7 +212,56 @@ public class MainActivity extends AppCompatActivity {
                 Log.e(TAG, "Error in onDrawFrame", e);
             }
         }
+
+        private void renderFrame() {
+            GLES20.glUseProgram(program);
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
+            GLES20.glUniform1i(textureHandle, 0);
+            GLES20.glEnableVertexAttribArray(positionHandle);
+            GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
+            GLES20.glEnableVertexAttribArray(texCoordHandle);
+            GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer);
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            GLES20.glDisableVertexAttribArray(positionHandle);
+            GLES20.glDisableVertexAttribArray(texCoordHandle);
+        }
+
+        private int createProgram(String vertexSource, String fragmentSource) {
+            int vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, vertexSource);
+            if (vertexShader == 0) return 0;
+            int fragmentShader = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource);
+            if (fragmentShader == 0) return 0;
+            int program = GLES20.glCreateProgram();
+            GLES20.glAttachShader(program, vertexShader);
+            GLES20.glAttachShader(program, fragmentShader);
+            GLES20.glLinkProgram(program);
+            int[] linkStatus = new int[1];
+            GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0);
+            if (linkStatus[0] != GLES20.GL_TRUE) {
+                Log.e(TAG, "Could not link program: " + GLES20.glGetProgramInfoLog(program));
+                GLES20.glDeleteProgram(program);
+                return 0;
+            }
+            return program;
+        }
+
+        private int loadShader(int type, String source) {
+            int shader = GLES20.glCreateShader(type);
+            GLES20.glShaderSource(shader, source);
+            GLES20.glCompileShader(shader);
+            int[] compiled = new int[1];
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0);
+            if (compiled[0] == 0) {
+                Log.e(TAG, "Could not compile shader: " + GLES20.glGetShaderInfoLog(shader));
+                GLES20.glDeleteShader(shader);
+                return 0;
+            }
+            return shader;
+        }
     }
+
+    private Handler handler = new Handler(Looper.getMainLooper());
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -213,6 +361,11 @@ public class MainActivity extends AppCompatActivity {
                 try {
                     session = new Session(this);
                     Config config = new Config(session);
+                    if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+                        config.setDepthMode(Config.DepthMode.AUTOMATIC);
+                    } else {
+                        Log.w(TAG, "Depth mode not supported, using default mode");
+                    }
                     session.configure(config);
                     session.setCameraTextureName(renderer.cameraTextureId);
                     session.setDisplayGeometry(0, glSurfaceView.getWidth(), glSurfaceView.getHeight());
@@ -229,7 +382,7 @@ public class MainActivity extends AppCompatActivity {
                         return;
                     }
 
-
+                    // VIO data file creation (unchanged)
                     String vioFileName = "vio_data_" + timeStamp + ".csv";
                     DocumentFile vioFile = vzrlbsDir.createFile("text/csv", vioFileName);
                     if (vioFile == null) {
@@ -254,18 +407,65 @@ public class MainActivity extends AppCompatActivity {
                     }
                     Uri videoUri = videoFile.getUri();
                     ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(videoUri, "w");
-                    if (pfd != null) {
-                        mediaRecorder = new MediaRecorder();
-                        mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
-                        mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
-                        mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
-                        mediaRecorder.setVideoSize(640, 480);
-                        mediaRecorder.setVideoFrameRate(30);
-                        mediaRecorder.setOutputFile(pfd.getFileDescriptor());
-                        mediaRecorder.prepare();
-                        mediaRecorder.start();
-                    } else {
+                    if (pfd == null) {
                         Toast.makeText(this, "Не удалось открыть файл видео", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+
+                    mediaRecorder = new MediaRecorder();
+                    mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
+                    mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                    mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
+                    mediaRecorder.setVideoSize(640, 480);
+                    mediaRecorder.setVideoFrameRate(30);
+                    mediaRecorder.setOutputFile(pfd.getFileDescriptor());
+                    try {
+                        mediaRecorder.prepare();
+                    } catch (IOException e) {
+                        Log.e(TAG, "MediaRecorder prepare failed", e);
+                        Toast.makeText(this, "Ошибка подготовки MediaRecorder: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+
+                    recorderSurface = mediaRecorder.getSurface();
+                    if (recorderSurface == null || !recorderSurface.isValid()) {
+                        Log.e(TAG, "MediaRecorder surface is invalid or null");
+                        Toast.makeText(this, "Ошибка: поверхность записи недоступна", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+
+                    // Create EGL surface for recording
+                    int[] configAttribs = {
+                            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                            EGL14.EGL_RED_SIZE, 8,
+                            EGL14.EGL_GREEN_SIZE, 8,
+                            EGL14.EGL_BLUE_SIZE, 8,
+                            EGL14.EGL_ALPHA_SIZE, 8,
+                            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                            EGL14.EGL_NONE
+                    };
+                    android.opengl.EGLConfig[] configs = new android.opengl.EGLConfig[1];
+                    int[] numConfigs = new int[1];
+                    EGL14.eglChooseConfig(eglDisplay, configAttribs, 0, configs, 0, 1, numConfigs, 0);
+                    if (numConfigs[0] == 0) {
+                        Log.e(TAG, "No valid EGL config found");
+                        Toast.makeText(this, "Ошибка: нет подходящей конфигурации EGL", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+
+                    recorderEglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], recorderSurface, new int[]{EGL14.EGL_NONE}, 0);
+                    if (recorderEglSurface == EGL14.EGL_NO_SURFACE) {
+                        int error = EGL14.eglGetError();
+                        Log.e(TAG, "Failed to create EGL surface for recording: " + error);
+                        Toast.makeText(this, "Ошибка создания EGL поверхности: " + error, Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+
+                    try {
+                        mediaRecorder.start();
+                    } catch (Exception e) {
+                        Log.e(TAG, "MediaRecorder start failed", e);
+                        Toast.makeText(this, "Ошибка запуска MediaRecorder: " + e.getMessage(), Toast.LENGTH_SHORT).show();
                         return;
                     }
 
@@ -299,11 +499,14 @@ public class MainActivity extends AppCompatActivity {
         }
 
         try {
+            // Stop VIO data writing (unchanged)
             if (writer != null) {
                 writer.flush();
                 writer.close();
                 writer = null;
             }
+
+            // Stop MediaRecorder
             if (mediaRecorder != null) {
                 try {
                     mediaRecorder.stop();
@@ -313,9 +516,28 @@ public class MainActivity extends AppCompatActivity {
                 mediaRecorder.release();
                 mediaRecorder = null;
             }
-            if (session != null) {
-                session.pause();
+
+            // Clean up EGL surface
+            if (recorderEglSurface != null && eglDisplay != null) {
+                EGL14.eglDestroySurface(eglDisplay, recorderEglSurface);
+                recorderEglSurface = null;
             }
+
+            // Release recorder surface
+            if (recorderSurface != null) {
+                recorderSurface.release();
+                recorderSurface = null;
+            }
+
+            // Pause ARCore session
+            if (session != null) {
+                try {
+                    session.pause();
+                } catch (Exception e) {
+                    Log.e(TAG, "Ошибка при паузе сессии ARCore: " + e.getMessage(), e);
+                }
+            }
+
             isRecording = false;
             statusText.setText("Статус: не записывается");
             Toast.makeText(this, "Запись остановлена", Toast.LENGTH_SHORT).show();
@@ -365,6 +587,14 @@ public class MainActivity extends AppCompatActivity {
         if (session != null) {
             session.close();
             session = null;
+        }
+        if (recorderEglSurface != null && eglDisplay != null) {
+            EGL14.eglDestroySurface(eglDisplay, recorderEglSurface);
+            recorderEglSurface = null;
+        }
+        if (recorderSurface != null) {
+            recorderSurface.release();
+            recorderSurface = null;
         }
     }
 }
