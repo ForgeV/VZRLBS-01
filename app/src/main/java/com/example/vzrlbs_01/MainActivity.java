@@ -481,6 +481,7 @@ public class MainActivity extends AppCompatActivity {
             isInitialized = true;
         }
 
+
         @Override
         public void onSurfaceChanged(GL10 gl, int width, int height) {
             GLES20.glViewport(0, 0, width, height);
@@ -590,7 +591,7 @@ public class MainActivity extends AppCompatActivity {
     private static class VioData {
         long timestamp;
         Pose pose;
-
+        /// //////////
         VioData(long timestamp, Pose pose) {
             this.timestamp = timestamp;
             this.pose = pose;
