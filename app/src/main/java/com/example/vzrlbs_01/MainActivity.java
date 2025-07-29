@@ -1,6 +1,7 @@
 package com.example.vzrlbs_01;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -12,12 +13,14 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.MotionEvent;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.collection.ArraySet;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.documentfile.provider.DocumentFile;
@@ -64,7 +67,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView statusText;
     private Uri saveUri;
     private List<VioData> vioDataList;
-
+    private List<TouchData> touchDataList;
     private Handler handler = new Handler(Looper.getMainLooper());
 
     private enum AppState {
@@ -73,6 +76,7 @@ public class MainActivity extends AppCompatActivity {
         PLAYBACK
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -84,7 +88,20 @@ public class MainActivity extends AppCompatActivity {
         renderer = new MyRenderer();
         glSurfaceView.setRenderer(renderer);
         glSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
-
+        glSurfaceView.setOnTouchListener((v, event) -> {
+            if (appState == AppState.RECORDING || appState == AppState.PLAYBACK) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
+                    float x = event.getX();
+                    float y = event.getY();
+                    long timestamp = renderer.latestFrameTimestamp;
+                    ArraySet<Object> touchDataList = new ArraySet<>();
+                    touchDataList.add(new TouchData(timestamp, x, y));
+                    Log.d(TAG, "Recorded touch: timestamp=" + timestamp + ", x=" + x + ", y=" + y);
+                }
+            }
+            return true;
+        });
         statusText = findViewById(R.id.status_text);
         Button startButton = findViewById(R.id.start_button);
         Button stopButton = findViewById(R.id.stop_button);
@@ -176,6 +193,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startRecording() {
+        touchDataList = new ArrayList<>();
         if (appState != AppState.IDLE) {
             Toast.makeText(this, "Невозможно начать запись во время воспроизведения", Toast.LENGTH_SHORT).show();
             return;
@@ -290,6 +308,39 @@ public class MainActivity extends AppCompatActivity {
             }
 
             appState = AppState.IDLE;
+            if (touchDataList != null && !touchDataList.isEmpty()) {
+                try {
+                    String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+                    DocumentFile documentFile = DocumentFile.fromTreeUri(this, saveUri);
+                    DocumentFile vzrlbsDir = documentFile.findFile("VZRLBS_01");
+                    if (vzrlbsDir == null) {
+                        vzrlbsDir = documentFile.createDirectory("VZRLBS_01");
+                    }
+                    if (vzrlbsDir == null) {
+                        throw new Exception("Не удалось создать директорию VZRLBS_01");
+                    }
+                    String csvFileName = "touch_data_" + timeStamp + ".csv";
+                    DocumentFile csvFile = vzrlbsDir.createFile("text/csv", csvFileName);
+                    if (csvFile == null) {
+                        throw new Exception("Не удалось создать файл CSV");
+                    }
+                    Uri csvUri = csvFile.getUri();
+                    try (OutputStream os = getContentResolver().openOutputStream(csvUri)) {
+                        assert os != null;
+                        PrintWriter writer = new PrintWriter(os);
+                        writer.println("timestamp,x,y");
+                        for (TouchData data : touchDataList) {
+                            writer.println(data.timestamp + "," + data.x + "," + data.y);
+                        }
+                        writer.flush();
+                        Log.d(TAG, "Saved " + touchDataList.size() + " touch data entries to " + csvFileName);
+                    }
+                    Toast.makeText(this, "Данные касаний сохранены в " + csvFileName, Toast.LENGTH_SHORT).show();
+                } catch (Exception e) {
+                    Log.e(TAG, "Ошибка при сохранении данных касаний", e);
+                    Toast.makeText(this, "Ошибка при сохранении данных касаний: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                }
+            }
             statusText.setText("Статус: не записывается");
             Toast.makeText(this, "Запись остановлена", Toast.LENGTH_SHORT).show();
         } catch (RecordingFailedException e) {
@@ -303,7 +354,7 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Невозможно начать воспроизведение во время записи или воспроизведения", Toast.LENGTH_SHORT).show();
             return;
         }
-
+        touchDataList = new ArrayList<>();
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("video/mp4");
@@ -357,6 +408,39 @@ public class MainActivity extends AppCompatActivity {
             } catch (Exception e) {
                 Log.e(TAG, "Ошибка при сохранении данных VIO", e);
                 Toast.makeText(this, "Ошибка при сохранении данных VIO: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+            if (touchDataList != null && !touchDataList.isEmpty()) {
+                try {
+                    String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+                    DocumentFile documentFile = DocumentFile.fromTreeUri(this, saveUri);
+                    DocumentFile vzrlbsDir = documentFile.findFile("VZRLBS_01");
+                    if (vzrlbsDir == null) {
+                        vzrlbsDir = documentFile.createDirectory("VZRLBS_01");
+                    }
+                    if (vzrlbsDir == null) {
+                        throw new Exception("Не удалось создать директорию VZRLBS_01");
+                    }
+                    String csvFileName = "touch_data_" + timeStamp + ".csv";
+                    DocumentFile csvFile = vzrlbsDir.createFile("text/csv", csvFileName);
+                    if (csvFile == null) {
+                        throw new Exception("Не удалось создать файл CSV");
+                    }
+                    Uri csvUri = csvFile.getUri();
+                    try (OutputStream os = getContentResolver().openOutputStream(csvUri)) {
+                        assert os != null;
+                        PrintWriter writer = new PrintWriter(os);
+                        writer.println("timestamp,x,y");
+                        for (TouchData data : touchDataList) {
+                            writer.println(data.timestamp + "," + data.x + "," + data.y);
+                        }
+                        writer.flush();
+                        Log.d(TAG, "Saved " + touchDataList.size() + " touch data entries to " + csvFileName);
+                    }
+                    Toast.makeText(this, "Данные касаний сохранены в " + csvFileName, Toast.LENGTH_SHORT).show();
+                } catch (Exception e) {
+                    Log.e(TAG, "Ошибка при сохранении данных касаний", e);
+                    Toast.makeText(this, "Ошибка при сохранении данных касаний: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                }
             }
         } else {
             Log.e(TAG, "No VIO data to save, vioDataList is empty or null");
@@ -420,7 +504,7 @@ public class MainActivity extends AppCompatActivity {
         private int textureHandle;
         private FloatBuffer vertexBuffer;
         private FloatBuffer texCoordBuffer;
-
+        private volatile long latestFrameTimestamp;
         private static final String VERTEX_SHADER =
                 "attribute vec4 aPosition;\n" +
                         "attribute vec2 aTexCoord;\n" +
@@ -502,6 +586,7 @@ public class MainActivity extends AppCompatActivity {
                     RecordingStatus status = session.getRecordingStatus();
                     Log.d(TAG, "Recording status in onDrawFrame: " + status);
                     Frame frame = session.update();
+                    latestFrameTimestamp = frame.getTimestamp();
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
                     renderFrame();
                 } catch (SessionPausedException e) {
@@ -515,6 +600,7 @@ public class MainActivity extends AppCompatActivity {
                     Log.d(TAG, "Playback status in onDrawFrame: " + status);
                     if (status == PlaybackStatus.OK) {
                         Frame frame = session.update();
+                        latestFrameTimestamp = frame.getTimestamp();
                         Pose pose = frame.getCamera().getPose();
                         if (pose != null) {
                             vioDataList.add(new VioData(frame.getTimestamp(), pose));
@@ -595,6 +681,17 @@ public class MainActivity extends AppCompatActivity {
         VioData(long timestamp, Pose pose) {
             this.timestamp = timestamp;
             this.pose = pose;
+        }
+    }
+    private static class TouchData {
+        long timestamp;
+        float x;
+        float y;
+
+        TouchData(long timestamp, float x, float y) {
+            this.timestamp = timestamp;
+            this.x = x;
+            this.y = y;
         }
     }
 }
