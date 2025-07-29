@@ -1,6 +1,7 @@
 package com.example.vzrlbs_01;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -12,6 +13,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.MotionEvent;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -23,12 +25,15 @@ import androidx.core.content.ContextCompat;
 import androidx.documentfile.provider.DocumentFile;
 
 import com.google.ar.core.ArCoreApk;
+import com.google.ar.core.Camera;
+import com.google.ar.core.CameraIntrinsics;
 import com.google.ar.core.Config;
 import com.google.ar.core.Frame;
 import com.google.ar.core.Pose;
 import com.google.ar.core.RecordingConfig;
 import com.google.ar.core.RecordingStatus;
 import com.google.ar.core.Session;
+import com.google.ar.core.TrackingState;
 import com.google.ar.core.PlaybackStatus;
 import com.google.ar.core.exceptions.CameraNotAvailableException;
 import com.google.ar.core.exceptions.RecordingFailedException;
@@ -36,6 +41,8 @@ import com.google.ar.core.exceptions.SessionPausedException;
 import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException;
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException;
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException;
+
+import org.json.JSONObject;
 
 import java.io.PrintWriter;
 import java.io.OutputStream;
@@ -64,7 +71,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView statusText;
     private Uri saveUri;
     private List<VioData> vioDataList;
-
+    private List<TouchData> touchDataList;
     private Handler handler = new Handler(Looper.getMainLooper());
 
     private enum AppState {
@@ -73,6 +80,7 @@ public class MainActivity extends AppCompatActivity {
         PLAYBACK
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -84,7 +92,19 @@ public class MainActivity extends AppCompatActivity {
         renderer = new MyRenderer();
         glSurfaceView.setRenderer(renderer);
         glSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
-
+        glSurfaceView.setOnTouchListener((v, event) -> {
+            if (appState == AppState.RECORDING || appState == AppState.PLAYBACK) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
+                    float x = event.getX();
+                    float y = event.getY();
+                    long timestamp = renderer.latestFrameTimestamp;
+                    touchDataList.add(new TouchData(timestamp, x, y));
+                    Log.d(TAG, "Recorded touch: timestamp=" + timestamp + ", x=" + x + ", y=" + y);
+                }
+            }
+            return true;
+        });
         statusText = findViewById(R.id.status_text);
         Button startButton = findViewById(R.id.start_button);
         Button stopButton = findViewById(R.id.stop_button);
@@ -140,10 +160,9 @@ public class MainActivity extends AppCompatActivity {
                         config.setDepthMode(Config.DepthMode.AUTOMATIC);
                     }
                     session.configure(config);
-                    session.setCameraTextureName(renderer.cameraTextureId);
                     session.setDisplayGeometry(0, glSurfaceView.getWidth(), glSurfaceView.getHeight());
-                    Log.d(TAG, "New session created for playback");
                     session.setPlaybackDatasetUri(mp4Uri);
+                    session.setCameraTextureName(renderer.cameraTextureId);
                     session.resume();
                     appState = AppState.PLAYBACK;
                     vioDataList = new ArrayList<>();
@@ -176,6 +195,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startRecording() {
+
+        touchDataList = new ArrayList<>();
         if (appState != AppState.IDLE) {
             Toast.makeText(this, "Невозможно начать запись во время воспроизведения", Toast.LENGTH_SHORT).show();
             return;
@@ -246,8 +267,18 @@ public class MainActivity extends AppCompatActivity {
                     session.resume();
                     Log.d(TAG, "Session resumed after starting recording");
 
+                    glSurfaceView.queueEvent(() -> {
+                        try {
+                            Frame frame = session.update();
+                            saveCameraParameters(frame);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Error getting frame for camera parameters", e);
+                        }
+                    });
+
                     appState = AppState.RECORDING;
                     statusText.setText("Статус: запись");
+
                     Toast.makeText(this, "Запись начата в Documents/VZRLBS_01", Toast.LENGTH_SHORT).show();
                 } catch (UnavailableArcoreNotInstalledException e) {
                     Log.e(TAG, "ARCore не установлен", e);
@@ -272,6 +303,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void stopRecording() {
+
+        saveTouchData();
         if (appState != AppState.RECORDING) {
             Toast.makeText(this, "Запись не идет", Toast.LENGTH_SHORT).show();
             return;
@@ -420,6 +453,7 @@ public class MainActivity extends AppCompatActivity {
         private int textureHandle;
         private FloatBuffer vertexBuffer;
         private FloatBuffer texCoordBuffer;
+        private volatile long latestFrameTimestamp;
 
         private static final String VERTEX_SHADER =
                 "attribute vec4 aPosition;\n" +
@@ -481,7 +515,6 @@ public class MainActivity extends AppCompatActivity {
             isInitialized = true;
         }
 
-
         @Override
         public void onSurfaceChanged(GL10 gl, int width, int height) {
             GLES20.glViewport(0, 0, width, height);
@@ -502,6 +535,7 @@ public class MainActivity extends AppCompatActivity {
                     RecordingStatus status = session.getRecordingStatus();
                     Log.d(TAG, "Recording status in onDrawFrame: " + status);
                     Frame frame = session.update();
+                    latestFrameTimestamp = frame.getTimestamp();
                     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
                     renderFrame();
                 } catch (SessionPausedException e) {
@@ -515,27 +549,31 @@ public class MainActivity extends AppCompatActivity {
                     Log.d(TAG, "Playback status in onDrawFrame: " + status);
                     if (status == PlaybackStatus.OK) {
                         Frame frame = session.update();
-                        Pose pose = frame.getCamera().getPose();
-                        if (pose != null) {
-                            vioDataList.add(new VioData(frame.getTimestamp(), pose));
-                            Log.d(TAG, "Added VIO data: timestamp=" + frame.getTimestamp() +
-                                    ", position=[" + pose.getTranslation()[0] + "," +
-                                    pose.getTranslation()[1] + "," + pose.getTranslation()[2] + "]");
+                        Camera camera = frame.getCamera();
+                        long timestamp = frame.getTimestamp();
+                        if (camera.getTrackingState() == TrackingState.TRACKING && timestamp > 0) {
+                            Pose pose = camera.getPose();
+                            vioDataList.add(new VioData(timestamp, pose));
+                            Log.d(TAG, "Added VIO data: timestamp=" + timestamp + ", position=[" + pose.getTranslation()[0] + "," + pose.getTranslation()[1] + "," + pose.getTranslation()[2] + "]");
                         } else {
-                            Log.w(TAG, "Pose is null for frame at timestamp: " + frame.getTimestamp());
+                            Log.w(TAG, "Invalid frame: tracking state=" + camera.getTrackingState() + ", timestamp=" + timestamp);
                         }
                         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
                         renderFrame();
-                    } else if (status == PlaybackStatus.FINISHED || status == PlaybackStatus.IO_ERROR) {
-                        Log.d(TAG, "Playback stopped or errored, status: " + status);
-
+                    } else if (status == PlaybackStatus.FINISHED) {
+                        Log.d(TAG, "Playback finished");
+                        handler.post(() -> stopPlayback());
+                    } else if (status == PlaybackStatus.IO_ERROR) {
+                        Log.e(TAG, "Playback IO error");
+                        handler.post(() -> {
+                            Toast.makeText(MainActivity.this, "Ошибка воспроизведения: IO error", Toast.LENGTH_SHORT).show();
+                            stopPlayback();
+                        });
                     }
                 } catch (SessionPausedException e) {
                     Log.e(TAG, "Session is paused in onDrawFrame during playback", e);
-
                 } catch (Exception e) {
                     Log.e(TAG, "Error in onDrawFrame during playback", e);
-
                 }
             }
         }
@@ -553,6 +591,7 @@ public class MainActivity extends AppCompatActivity {
             GLES20.glDisableVertexAttribArray(positionHandle);
             GLES20.glDisableVertexAttribArray(texCoordHandle);
         }
+
 
         private int createProgram(String vertexSource, String fragmentSource) {
             int vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, vertexSource);
@@ -587,7 +626,101 @@ public class MainActivity extends AppCompatActivity {
             return shader;
         }
     }
+    private void saveTouchData() {
+        if (touchDataList == null || touchDataList.isEmpty()) {
+            Log.d(TAG, "No touch data to save");
+            return;
+        }
 
+        try {
+            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+            DocumentFile documentFile = DocumentFile.fromTreeUri(this, saveUri);
+            DocumentFile vzrlbsDir = documentFile.findFile("VZRLBS_01");
+            if (vzrlbsDir == null) {
+                vzrlbsDir = documentFile.createDirectory("VZRLBS_01");
+            }
+            if (vzrlbsDir == null) {
+                throw new Exception("Не удалось создать директорию VZRLBS_01");
+            }
+            String csvFileName = "touch_data_" + timeStamp + ".csv";
+            DocumentFile csvFile = vzrlbsDir.createFile("text/csv", csvFileName);
+            if (csvFile == null) {
+                throw new Exception("Не удалось создать файл CSV");
+            }
+            Uri csvUri = csvFile.getUri();
+            try (OutputStream os = getContentResolver().openOutputStream(csvUri)) {
+                PrintWriter writer = new PrintWriter(os);
+                writer.println("timestamp,x,y");
+                for (TouchData data : touchDataList) {
+                    writer.println(data.timestamp + "," + data.x + "," + data.y);
+                }
+                writer.flush();
+                Log.d(TAG, "Saved " + touchDataList.size() + " touch data entries to " + csvFileName);
+                Toast.makeText(this, "Данные касаний сохранены в " + csvFileName, Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Ошибка при сохранении данных касаний", e);
+            Toast.makeText(this, "Ошибка при сохранении данных касаний: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+    private void saveCameraParameters(Frame frame) {
+        if (frame == null) return;
+
+        try {
+            Camera camera = frame.getCamera();
+            CameraIntrinsics intrinsics = camera.getImageIntrinsics();
+
+            float[] focalLength = intrinsics.getFocalLength();
+            float[] principalPoint = intrinsics.getPrincipalPoint();
+            int[] imageDimensions = intrinsics.getImageDimensions();
+
+            JSONObject json = new JSONObject();
+            json.put("focal_length_x", focalLength[0]);
+            json.put("focal_length_y", focalLength[1]);
+            json.put("principal_point_x", principalPoint[0]);
+            json.put("principal_point_y", principalPoint[1]);
+            json.put("image_width", imageDimensions[0]);
+            json.put("image_height", imageDimensions[1]);
+
+            String jsonString = json.toString();
+
+            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+            DocumentFile documentFile = DocumentFile.fromTreeUri(this, saveUri);
+            DocumentFile vzrlbsDir = documentFile.findFile("VZRLBS_01");
+            if (vzrlbsDir == null) {
+                vzrlbsDir = documentFile.createDirectory("VZRLBS_01");
+            }
+            if (vzrlbsDir == null) {
+                throw new Exception("Не удалось создать директорию VZRLBS_01");
+            }
+            String jsonFileName = "camera_params_" + timeStamp + ".json";
+            DocumentFile jsonFile = vzrlbsDir.createFile("application/json", jsonFileName);
+            if (jsonFile == null) {
+                throw new Exception("Не удалось создать JSON-файл");
+            }
+            Uri jsonUri = jsonFile.getUri();
+            try (OutputStream os = getContentResolver().openOutputStream(jsonUri)) {
+                os.write(jsonString.getBytes());
+                os.flush();
+                Log.d(TAG, "Camera parameters saved to " + jsonFileName);
+                Toast.makeText(this, "Параметры камеры сохранены в " + jsonFileName, Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Ошибка при сохранении параметров камеры", e);
+            Toast.makeText(this, "Ошибка при сохранении параметров камеры: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+    private static class TouchData {
+        long timestamp;
+        float x;
+        float y;
+
+        TouchData(long timestamp, float x, float y) {
+            this.timestamp = timestamp;
+            this.x = x;
+            this.y = y;
+        }
+    }
     private static class VioData {
         long timestamp;
         Pose pose;
