@@ -109,10 +109,20 @@ public class MainActivity extends AppCompatActivity {
         Button startButton = findViewById(R.id.start_button);
         Button stopButton = findViewById(R.id.stop_button);
         Button extractButton = findViewById(R.id.extract_button);
+        Button filesButton = findViewById(R.id.files_button);
 
         startButton.setOnClickListener(v -> startRecording());
         stopButton.setOnClickListener(v -> stopRecording());
         extractButton.setOnClickListener(v -> startPlayback());
+        filesButton.setOnClickListener(v -> {
+            if (saveUri != null) {
+                Intent intent = new Intent(MainActivity.this, FileExplorerActivity.class);
+                intent.setData(saveUri);
+                startActivity(intent);
+            } else {
+                Toast.makeText(MainActivity.this, "Сначала выберите директорию для сохранения", Toast.LENGTH_SHORT).show();
+            }
+        });
 
         SharedPreferences prefs = getSharedPreferences("app_prefs", MODE_PRIVATE);
         String uriString = prefs.getString("save_uri", null);
