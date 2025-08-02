@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>ARCore Object Movement Viewer</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+      }
+      #fileInput {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <input type="file" id="fileInput" accept=".csv" />
+
+    <script type="module">
+      import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js';
+
+      let scene, camera, renderer;
+      let path = [], quaternions = [], timestamps = [];
+      let cube, isAnimating = false, startTime = null;
+
+      init();
+
+      function init() {
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xf0f0f0);
+
+        camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
+        camera.position.set(1.5, 1.5, 2);
+        camera.lookAt(0, 0, 0);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        scene.add(new THREE.AxesHelper(0.5));
+        scene.add(new THREE.GridHelper(2, 10));
+
+        const geometry = new THREE.BoxGeometry(0.05, 0.05, 0.05);
+        const material = new THREE.MeshNormalMaterial();
+        cube = new THREE.Mesh(geometry, material);
+        scene.add(cube);
+
+        document.getElementById('fileInput').addEventListener('change', handleCSVFile);
+
+        window.addEventListener('resize', () => {
+          camera.aspect = window.innerWidth / window.innerHeight;
+          camera.updateProjectionMatrix();
+          renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+      }
+
+      function handleCSVFile(event) {
+        const file = event.target.files[0];
+        const reader = new FileReader();
+
+        reader.onload = function (e) {
+          const text = e.target.result;
+          const lines = text.split('\n').map(line => line.trim()).filter(line => line !== '');
+          path = [];
+          quaternions = [];
+          timestamps = [];
+
+          for (let i = 1; i < lines.length; i++) {
+            const [timestamp, tx, ty, tz, qx, qy, qz, qw] = lines[i].split(',').map(Number);
+
+            // ARCore → Three.js
+            const position = new THREE.Vector3(tx, -ty, -tz);
+            const quaternion = new THREE.Quaternion(-qx, qy, qz, -qw);
+
+            path.push(position);
+            quaternions.push(quaternion);
+            timestamps.push(timestamp);
+          }
+
+          drawPath();
+          isAnimating = true;
+          startTime = null;
+        };
+
+        reader.readAsText(file);
+      }
+
+      function drawPath() {
+        const geometry = new THREE.BufferGeometry().setFromPoints(path);
+        const material = new THREE.LineBasicMaterial({ color: 0x0000ff });
+        const line = new THREE.Line(geometry, material);
+        scene.add(line);
+      }
+
+      function animate(time) {
+        requestAnimationFrame(animate);
+
+        if (isAnimating && path.length > 0) {
+          if (!startTime) startTime = time;
+          const elapsed = time - startTime;
+
+          let index = 0;
+          while (index < timestamps.length - 1 &&
+            elapsed >= (timestamps[index] - timestamps[0]) / 1e6) {
+            index++;
+          }
+
+          if (index >= path.length) {
+            index = path.length - 1;
+            isAnimating = false;
+          }
+
+          cube.position.copy(path[index]);
+          cube.quaternion.copy(quaternions[index]);
+        }
+
+        renderer.render(scene, camera);
+      }
+    </script>
+  </body>
+</html>
