@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Camera Animation from CSV</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    #fileInput {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+<input type="file" id="fileInput" accept=".csv" />
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js';
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.01, 100);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.AxesHelper(10));
+scene.add(new THREE.GridHelper(100, 500));
+
+const path = [];
+const quaternions = [];
+let timestamps = [];
+let startTime = null;
+let isAnimating = false;
+
+document.getElementById('fileInput').addEventListener('change', handleCSVFile);
+
+function handleCSVFile(event) {
+  const file = event.target.files[0];
+  const reader = new FileReader();
+
+  reader.onload = function (e) {
+    const text = e.target.result;
+    const lines = text.split('\n').map(line => line.trim()).filter(line => line !== '');
+    lines.shift(); // remove header
+
+    path.length = 0;
+    quaternions.length = 0;
+    timestamps.length = 0;
+
+    for (const line of lines) {
+      const [timestamp, tx, ty, tz, qx, qy, qz, qw] = line.split(',').map(Number);
+
+      // ARCore → three.js coordinate conversion
+      path.push(new THREE.Vector3(tx, ty, -tz));
+      quaternions.push(new THREE.Quaternion(-qx, -qy, qz, qw));
+      timestamps.push(timestamp);
+    }
+
+    drawPath();
+    startTime = null;
+    isAnimating = true;
+    animate();
+  };
+
+  reader.readAsText(file);
+}
+
+function drawPath() {
+  const geometry = new THREE.BufferGeometry().setFromPoints(path);
+  const material = new THREE.LineBasicMaterial({ color: 0xff0000 });
+  const line = new THREE.Line(geometry, material);
+  scene.add(line);
+}
+
+function animate(time) {
+  requestAnimationFrame(animate);
+
+  if (!isAnimating || path.length === 0) return;
+
+  if (!startTime) startTime = time;
+  const elapsed = time - startTime;
+
+  // Найдём индекс текущего времени
+  let index = 0;
+  while (index < timestamps.length - 1 &&
+         elapsed >= (timestamps[index] - timestamps[0]) / 1e6) {
+    index++;
+  }
+
+  if (index >= path.length) index = path.length - 1;
+
+  camera.position.copy(path[index]);
+  camera.quaternion.copy(quaternions[index]);  
+  
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
