@@ -5,6 +5,7 @@ import android.annotation.SuppressLint;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.media.Image;
 import android.net.Uri;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
@@ -42,6 +43,12 @@ import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException;
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException;
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException;
 
+import org.eclipse.paho.android.service.MqttAndroidClient;
+import org.eclipse.paho.client.mqttv3.IMqttActionListener;
+import org.eclipse.paho.client.mqttv3.IMqttToken;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.json.JSONObject;
 
 import java.io.PrintWriter;
@@ -53,9 +60,13 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
+
+import io.github.thibaultbee.srtdroid.core.models.SrtSocket;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -72,10 +83,18 @@ public class MainActivity extends AppCompatActivity {
     private Uri saveUri;
     private List<VioData> vioDataList;
     private List<TouchData> touchDataList;
+    private TouchData touchData;
     private Handler handler = new Handler(Looper.getMainLooper());
 
+    private MqttAndroidClient mqttClient;
+    private SrtSocket srtSocket;
+    private BlockingQueue<byte[]> srtQueue = new LinkedBlockingQueue<>();
+    private static final String BROKER_URL = "tcp://https://192.168.140.36:21883";
+    private static final String CLIENT_ID = "VZRLBS_Client_" + System.currentTimeMillis();
+    private static final String DESTINATION_IP = "https://192.168.140.36";
+    private static final int PORT = 25590;
     private enum AppState {
-        IDLE,
+        IDLE,               
         RECORDING,
         PLAYBACK
     }
@@ -85,6 +104,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        mqttClient = new MqttAndroidClient(this, BROKER_URL, CLIENT_ID);
 
         glSurfaceView = findViewById(R.id.gl_surface_view);
         glSurfaceView.setPreserveEGLContextOnPause(true);
@@ -101,6 +122,13 @@ public class MainActivity extends AppCompatActivity {
                     long timestamp = renderer.latestFrameTimestamp;
                     touchDataList.add(new TouchData(timestamp, x, y));
                     Log.d(TAG, "Recorded touch: timestamp=" + timestamp + ", x=" + x + ", y=" + y);
+                    String touchData = "action:" + event.getAction() + ", x:" + event.getX() + ", y:" + event.getY();
+                    MqttMessage message = new MqttMessage(touchData.getBytes());
+                    try {
+                        mqttClient.publish("touch_data", message);
+                    } catch (MqttException e) {
+                        e.printStackTrace();
+                    }
                 }
             }
             return true;
@@ -175,6 +203,8 @@ public class MainActivity extends AppCompatActivity {
                     session.setCameraTextureName(renderer.cameraTextureId);
                     session.resume();
                     appState = AppState.PLAYBACK;
+                    connectToMqtt();
+                    setupSrt();
                     vioDataList = new ArrayList<>();
                     statusText.setText("Статус: воспроизведение");
                     Toast.makeText(this, "Воспроизведение начато", Toast.LENGTH_SHORT).show();
@@ -313,7 +343,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void stopRecording() {
-
         saveTouchData();
         if (appState != AppState.RECORDING) {
             Toast.makeText(this, "Запись не идет", Toast.LENGTH_SHORT).show();
@@ -326,6 +355,7 @@ public class MainActivity extends AppCompatActivity {
             if (session != null) {
                 try {
                     session.pause();
+
                     Log.d(TAG, "Session paused after stopping recording");
                 } catch (Exception e) {
                     Log.e(TAG, "Ошибка при паузе сессии ARCore: " + e.getMessage(), e);
@@ -342,6 +372,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startPlayback() {
+        touchDataList = new ArrayList<>();
         if (appState != AppState.IDLE) {
             Toast.makeText(this, "Невозможно начать воспроизведение во время записи или воспроизведения", Toast.LENGTH_SHORT).show();
             return;
@@ -354,9 +385,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void stopPlayback() {
+        saveTouchData();
         if (session != null) {
             try {
                 session.pause();
+                disconnectMqtt();
+                if (srtSocket != null) {
+                    srtSocket.close();
+                    srtSocket = null;
+                }
                 Log.d(TAG, "Session paused in stopPlayback");
             } catch (Exception e) {
                 Log.e(TAG, "Ошибка при паузе сессии в stopPlayback", e);
@@ -406,7 +443,59 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Нет данных VIO для сохранения", Toast.LENGTH_SHORT).show();
         }
     }
+    private void disconnectMqtt() {
+        try {
+            mqttClient.disconnect();
+        } catch (MqttException e) {
+            e.printStackTrace();
+        }
+    }
+    private void connectToMqtt() {
+        MqttConnectOptions options = new MqttConnectOptions();
+        try {
+            IMqttToken token = mqttClient.connect(options);
+            token.setActionCallback(new IMqttActionListener() {
+                @Override
+                public void onSuccess(IMqttToken asyncActionToken) {
+                    Log.d("MQTT", "Connected");
+                }
 
+                @Override
+                public void onFailure(IMqttToken asyncActionToken, Throwable exception) {
+                    Log.e("MQTT", "Connection failed", exception);
+                }
+            });
+        } catch (MqttException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void setupSrt() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    srtSocket = new SrtSocket();
+                    srtSocket.connect(DESTINATION_IP, PORT);
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            while (appState == AppState.PLAYBACK) {
+                                try {
+                                    byte[] data = srtQueue.take();
+                                    srtSocket.send(data);
+                                } catch (Exception e) {
+                                    e.printStackTrace();
+                                }
+                            }
+                        }
+                    }).start();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }).start();
+    }
     @Override
     protected void onPause() {
         super.onPause();
@@ -465,6 +554,9 @@ public class MainActivity extends AppCompatActivity {
         private FloatBuffer texCoordBuffer;
         private volatile long latestFrameTimestamp;
 
+        private MqttAndroidClient mqttClient;
+        private BlockingQueue<byte[]> srtQueue;
+        
         private static final String VERTEX_SHADER =
                 "attribute vec4 aPosition;\n" +
                         "attribute vec2 aTexCoord;\n" +
@@ -559,15 +651,33 @@ public class MainActivity extends AppCompatActivity {
                     Log.d(TAG, "Playback status in onDrawFrame: " + status);
                     if (status == PlaybackStatus.OK) {
                         Frame frame = session.update();
+
                         Camera camera = frame.getCamera();
                         long timestamp = frame.getTimestamp();
                         if (camera.getTrackingState() == TrackingState.TRACKING && timestamp > 0) {
                             Pose pose = camera.getPose();
                             vioDataList.add(new VioData(timestamp, pose));
+
+                            String vioMessage = timestamp + "," + pose.toString();
+                            MqttMessage vioMqttMessage = new MqttMessage(vioMessage.getBytes());
+                            if (mqttClient != null && mqttClient.isConnected()) {
+                                mqttClient.publish("vio_data", vioMqttMessage);
+                                Log.d(TAG, "VIO data is published here:"+ BROKER_URL);
+                            } else{
+                                Log.d(TAG, "VIO is not sended");
+                            }
+
                             Log.d(TAG, "Added VIO data: timestamp=" + timestamp + ", position=[" + pose.getTranslation()[0] + "," + pose.getTranslation()[1] + "," + pose.getTranslation()[2] + "]");
                         } else {
                             Log.w(TAG, "Invalid frame: tracking state=" + camera.getTrackingState() + ", timestamp=" + timestamp);
                         }
+
+                        Image image = frame.acquireCameraImage();
+                        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                        byte[] data = new byte[buffer.remaining()];
+                        buffer.get(data);
+                        srtQueue.offer(data);
+
                         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
                         renderFrame();
                     } else if (status == PlaybackStatus.FINISHED) {
@@ -694,6 +804,14 @@ public class MainActivity extends AppCompatActivity {
 
             String jsonString = json.toString();
 
+            MqttMessage message = new MqttMessage(jsonString.getBytes());
+            if (mqttClient != null && mqttClient.isConnected()) {
+                mqttClient.publish("camera_params", message);
+                Log.d(TAG, "Camera Parameters published to:"+ BROKER_URL);
+            } else{
+                Log.d(TAG, "Error in Camera Parameters sending");
+            }
+
             String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
             DocumentFile documentFile = DocumentFile.fromTreeUri(this, saveUri);
             DocumentFile vzrlbsDir = documentFile.findFile("VZRLBS_01");
@@ -720,6 +838,7 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Ошибка при сохранении параметров камеры: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
     }
+    
     private static class TouchData {
         long timestamp;
         float x;
